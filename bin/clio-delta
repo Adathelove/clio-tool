@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# clio-delta - Generate holistic daily views of all agent activity
+#
+# Usage:
+#   clio-delta [--date DATE] [--gdrive] [--all]
+#
+# OUTPUT FORMAT:
+#   Creates deltas/YYYY-MM-DD.md (ISO 8601 date format)
+#   One delta file per calendar date
+#   See DELTA-FORMAT.md for complete specification
+#
+# DELTA FILE STRUCTURE:
+#   - Chronological analysis of all logs for date
+#   - SUCCESS/FAILURE/OPEN QUESTION extraction
+#   - Continuity mapping and dependency chains
+#   - "The Pick up Point" for next-day resumption
+
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Default settings
+TARGET_DATE=$(date +%Y-%m-%d)
+INCLUDE_GDRIVE=false
+INCLUDE_ALL=false
+DELTAS_DIR="${HOME}/repos/git/adathelove/clio-tool/deltas"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --date|-d)
+            TARGET_DATE="$2"
+            shift 2
+            ;;
+        --gdrive)
+            INCLUDE_GDRIVE=true
+            shift
+            ;;
+        --all)
+            INCLUDE_ALL=true
+            INCLUDE_GDRIVE=true
+            shift
+            ;;
+        --help|-h)
+            cat <<EOF
+Usage: clio-delta [OPTIONS]
+
+Generate holistic daily view of all agent activity.
+
+OPTIONS:
+    --date DATE     Generate delta for specific date (YYYY-MM-DD)
+    --gdrive        Include GDrive logs
+    --all           Include all cloud directories
+    --help          Show this help message
+
+OUTPUT FILE FORMAT:
+    Location:  deltas/YYYY-MM-DD.md
+    Format:    ISO 8601 date (one file per calendar date)
+    Example:   deltas/2026-01-23.md
+
+DELTA STRUCTURE:
+    1. Header with generation timestamp and log count
+    2. Executive Summary (projects, activity span)
+    3. Chronological Analysis (each log with context)
+    4. Comprehensive Analysis (patterns, insights)
+    5. The Pick up Point (end-of-day state for next day)
+    6. Summary Statistics
+
+EXAMPLES:
+    # Generate delta for today (end of day workflow)
+    clio-delta --gdrive
+
+    # Generate delta for specific date
+    clio-delta --date 2026-01-23 --gdrive
+
+    # Generate with all sources
+    clio-delta --all
+
+DAILY WORKFLOW:
+    End of day:
+      1. clio-delta --gdrive
+      2. \$EDITOR deltas/\$(date +%Y-%m-%d).md
+      3. Add "The Pick up Point" section with:
+         - State checks required for tomorrow
+         - Open threads waiting on responses
+         - Questions to resolve
+         - Context for next session
+
+    Next morning:
+      1. Read yesterday's Pick up Point
+      2. Execute state checks
+      3. Resume from continuity notes
+
+For complete format specification, see DELTA-FORMAT.md
+
+EOF
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Create deltas directory if it doesn't exist
+mkdir -p "$DELTAS_DIR"
+
+echo -e "${BOLD}Generating Delta Log${NC}"
+echo -e "${CYAN}Date:${NC} $TARGET_DATE"
+echo -e "${CYAN}Deltas Directory:${NC} $DELTAS_DIR"
+echo ""
+
+# Build find-agent-logs command
+FIND_CMD="${SCRIPT_DIR}/find-agent-logs --find"
+
+if [ "$INCLUDE_ALL" = "true" ]; then
+    FIND_CMD="$FIND_CMD --all"
+elif [ "$INCLUDE_GDRIVE" = "true" ]; then
+    FIND_CMD="$FIND_CMD --gdrive"
+fi
+
+FIND_CMD="$FIND_CMD ${HOME}"
+
+# Get all logs
+echo -e "${DIM}Finding logs...${NC}"
+ALL_LOGS=$($FIND_CMD)
+
+# Check for jq
+if ! command -v jq &> /dev/null; then
+    echo -e "${RED}Error: jq is required but not installed.${NC}" >&2
+    exit 1
+fi
+
+# Filter logs for target date
+DATE_LOGS=$(echo "$ALL_LOGS" | jq -c "[.[] | select(.date_from_name == \"$TARGET_DATE\")]")
+LOG_COUNT=$(echo "$DATE_LOGS" | jq 'length')
+
+if [ "$LOG_COUNT" -eq 0 ]; then
+    echo -e "${YELLOW}No logs found for $TARGET_DATE${NC}"
+    exit 0
+fi
+
+echo -e "${GREEN}✓ Found $LOG_COUNT log(s) for $TARGET_DATE${NC}"
+echo ""
+
+# Generate delta file
+DELTA_FILE="${DELTAS_DIR}/${TARGET_DATE}.md"
+
+echo -e "${CYAN}Generating: ${BOLD}$DELTA_FILE${NC}"
+
+# Write delta log header
+cat > "$DELTA_FILE" <<EOF
+# Delta Log - $TARGET_DATE
+
+**Generated**: $(date +"%Y-%m-%d %H:%M:%S")
+**Logs Analyzed**: $LOG_COUNT
+
+This is a holistic view of all agent activity for this date, aggregating insights from multiple project logs.
+
+---
+
+EOF
+
+# Add log inventory
+cat >> "$DELTA_FILE" <<EOF
+## Log Inventory
+
+EOF
+
+echo "$DATE_LOGS" | jq -r '.[] | "- **\(.project_dir | split("/") | last)**: `\(.path)`"' >> "$DELTA_FILE"
+
+cat >> "$DELTA_FILE" <<EOF
+
+---
+
+## Aggregated Insights
+
+EOF
+
+# Extract and aggregate content from each log
+SUCCESS_ITEMS=()
+FAILURE_ITEMS=()
+OPEN_QUESTIONS=()
+OTHER_CONTENT=()
+
+echo ""
+echo -e "${DIM}Analyzing logs...${NC}"
+
+while IFS= read -r log_path; do
+    [ -z "$log_path" ] && continue
+
+    project=$(dirname "$(dirname "$(dirname "$log_path")")" | xargs basename)
+
+    echo -e "${DIM}  - Processing: $project${NC}"
+
+    if [ -f "$log_path" ]; then
+        # Extract SUCCESS sections
+        if grep -q "^## SUCCESS" "$log_path"; then
+            while IFS= read -r line; do
+                if [ -n "$line" ]; then
+                    SUCCESS_ITEMS+=("**[$project]** $line")
+                fi
+            done < <(sed -n '/^## SUCCESS/,/^##/p' "$log_path" | grep -v "^##" | grep -v "^---" | sed '/^$/d')
+        fi
+
+        # Extract FAILURE sections
+        if grep -q "^## FAILURE" "$log_path"; then
+            while IFS= read -r line; do
+                if [ -n "$line" ]; then
+                    FAILURE_ITEMS+=("**[$project]** $line")
+                fi
+            done < <(sed -n '/^## FAILURE/,/^##/p' "$log_path" | grep -v "^##" | grep -v "^---" | sed '/^$/d')
+        fi
+
+        # Extract OPEN QUESTION sections
+        if grep -q "^## OPEN QUESTION" "$log_path"; then
+            while IFS= read -r line; do
+                if [ -n "$line" ]; then
+                    OPEN_QUESTIONS+=("**[$project]** $line")
+                fi
+            done < <(sed -n '/^## OPEN QUESTION/,/^##/p' "$log_path" | grep -v "^##" | grep -v "^---" | sed '/^$/d')
+        fi
+    fi
+done < <(echo "$DATE_LOGS" | jq -r '.[].path')
+
+# Write aggregated insights
+if [ ${#SUCCESS_ITEMS[@]} -gt 0 ]; then
+    cat >> "$DELTA_FILE" <<EOF
+### Successes
+
+EOF
+    printf '%s\n' "${SUCCESS_ITEMS[@]}" >> "$DELTA_FILE"
+    cat >> "$DELTA_FILE" <<EOF
+
+EOF
+fi
+
+if [ ${#FAILURE_ITEMS[@]} -gt 0 ]; then
+    cat >> "$DELTA_FILE" <<EOF
+### Failures / Issues
+
+EOF
+    printf '%s\n' "${FAILURE_ITEMS[@]}" >> "$DELTA_FILE"
+    cat >> "$DELTA_FILE" <<EOF
+
+EOF
+fi
+
+if [ ${#OPEN_QUESTIONS[@]} -gt 0 ]; then
+    cat >> "$DELTA_FILE" <<EOF
+### Open Questions
+
+EOF
+    printf '%s\n' "${OPEN_QUESTIONS[@]}" >> "$DELTA_FILE"
+    cat >> "$DELTA_FILE" <<EOF
+
+EOF
+fi
+
+# Add full logs section
+cat >> "$DELTA_FILE" <<EOF
+---
+
+## Full Log Contents
+
+EOF
+
+echo "$DATE_LOGS" | jq -r '.[].path' | while IFS= read -r log_path; do
+    [ -z "$log_path" ] && continue
+
+    project=$(dirname "$(dirname "$(dirname "$log_path")")" | xargs basename)
+
+    cat >> "$DELTA_FILE" <<EOF
+### $project
+
+\`\`\`
+EOF
+    cat "$log_path" >> "$DELTA_FILE"
+    cat >> "$DELTA_FILE" <<EOF
+\`\`\`
+
+EOF
+done
+
+echo ""
+echo -e "${GREEN}✓ Delta log generated: $DELTA_FILE${NC}"
+echo -e "${DIM}  - ${#SUCCESS_ITEMS[@]} successes${NC}"
+echo -e "${DIM}  - ${#FAILURE_ITEMS[@]} failures${NC}"
+echo -e "${DIM}  - ${#OPEN_QUESTIONS[@]} open questions${NC}"
+echo ""
+echo -e "${CYAN}View with:${NC} cat $DELTA_FILE"
+echo -e "${CYAN}Or open in editor:${NC} \$EDITOR $DELTA_FILE"

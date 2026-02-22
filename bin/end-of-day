@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# End of Day - Delta Generation and Review Script
+# Generates daily delta log and ensures Pick up Point is filled in
+
+set -e
+
+TODAY=$(date +%Y-%m-%d)
+DAY_NAME=$(date +%A)
+DELTA_FILE="deltas/$TODAY.md"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+cd "$REPO_ROOT"
+
+echo "=========================================="
+echo "END OF DAY - $DAY_NAME, $TODAY"
+echo "=========================================="
+echo ""
+
+# Step 1: Generate delta if it doesn't exist or regenerate
+echo "📊 Generating delta log for $TODAY..."
+echo ""
+
+if [ -f "$DELTA_FILE" ]; then
+    echo "⚠️  Delta already exists: $DELTA_FILE"
+    echo ""
+    read -p "Regenerate? (y/N): " regenerate
+    if [[ ! "$regenerate" =~ ^[Yy]$ ]]; then
+        echo "Using existing delta."
+    else
+        ./bin/clio-delta --gdrive
+    fi
+else
+    ./bin/clio-delta --gdrive
+fi
+
+echo ""
+echo "=========================================="
+echo "DELTA STATISTICS"
+echo "=========================================="
+wc -l "$DELTA_FILE"
+echo ""
+
+# Step 2: Check for Pick up Point section
+echo "🔍 Checking for 'The Pick up Point' section..."
+if grep -q "## The Pick up Point" "$DELTA_FILE"; then
+    echo "✅ Found 'The Pick up Point' section"
+    
+    # Check if it has content after the header
+    lines_after=$(grep -A 10 "## The Pick up Point" "$DELTA_FILE" | wc -l | tr -d ' ')
+    if [ "$lines_after" -gt 5 ]; then
+        echo "✅ Section has content ($lines_after lines)"
+    else
+        echo "⚠️  Section exists but may be empty or incomplete"
+        echo ""
+        echo "Please review and fill in:"
+        echo "  - Tomorrow's Focus"
+        echo "  - State Checks Required"
+        echo "  - Open Threads"
+        echo "  - Questions to Resolve"
+        echo "  - Context for Tomorrow"
+    fi
+else
+    echo "❌ 'The Pick up Point' section NOT FOUND"
+    echo ""
+    echo "Add this section at the end of the delta (before statistics if present)"
+    echo ""
+    echo "Template:"
+    cat << 'TEMPLATE'
+## The Pick up Point
+
+**Tomorrow's Focus**: [What needs immediate attention]
+
+**State Checks Required**:
+- [ ] [Thing to check/verify]
+- [ ] [Another thing to check]
+
+**Open Threads**:
+- [Project/Context] → [What's waiting] → [Who/what to check]
+
+**Questions to Resolve**:
+- [Decision needed]
+- [Technical choice pending]
+
+**Context for Tomorrow**:
+[Brief reminder of where you left off and mental state]
+TEMPLATE
+fi
+
+echo ""
+echo "=========================================="
+echo "NEXT STEPS"
+echo "=========================================="
+echo ""
+echo "1. Review delta: cat deltas/$TODAY.md"
+echo "2. Or open in editor: \$EDITOR deltas/$TODAY.md"
+echo "3. Fill in 'The Pick up Point' section if needed"
+echo "4. Commit delta to git when complete"
+echo ""
+echo "📂 Delta location: $DELTA_FILE"
+echo ""
+
+# Offer to open in editor
+read -p "Open delta in editor now? (y/N): " open_editor
+if [[ "$open_editor" =~ ^[Yy]$ ]]; then
+    ${EDITOR:-vim} "$DELTA_FILE"
+fi
+

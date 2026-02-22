@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# find-agent-logs - Find all .agent.dir log files across the system
+#
+# Usage:
+#   find-agent-logs [--locate|--find] [--gdrive|--all] [START_PATH]
+#
+# Options:
+#   --locate    Use locate database (fast, requires updatedb)
+#   --find      Use find command (slow, but always current)
+#   --gdrive    Include ~/Cloud/GDrive in search
+#   --all       Include all cloud directories (GDrive)
+#   START_PATH  Where to start search (default: ~/)
+#
+# Output: JSON array of log information
+
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Default settings
+METHOD="locate"
+START_PATH="${HOME}"
+INCLUDE_GDRIVE=false
+INCLUDE_ALL=false
+
+# Cloud directory paths
+GDRIVE_PATH="${HOME}/Cloud/GDrive"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --locate)
+            METHOD="locate"
+            shift
+            ;;
+        --find)
+            METHOD="find"
+            shift
+            ;;
+        --gdrive)
+            INCLUDE_GDRIVE=true
+            shift
+            ;;
+        --all)
+            INCLUDE_ALL=true
+            INCLUDE_GDRIVE=true
+            shift
+            ;;
+        --help|-h)
+            cat <<EOF
+Usage: find-agent-logs [OPTIONS] [START_PATH]
+
+Find all .agent.dir log files across the system.
+
+OPTIONS:
+    --locate        Use locate database (fast, requires updatedb)
+    --find          Use find command (slow, but always current)
+    --gdrive        Include ~/Cloud/GDrive in search for .agent.dir/Logs
+    --all           Include all cloud directories (currently: GDrive)
+    --help          Show this help message
+
+ARGUMENTS:
+    START_PATH      Where to start search (default: ~/)
+
+OUTPUT:
+    JSON array with log file information including dates
+
+EXAMPLES:
+    # Find all logs using locate
+    find-agent-logs --locate
+
+    # Find all logs including GDrive
+    find-agent-logs --find --gdrive
+
+    # Find all logs including all cloud directories
+    find-agent-logs --all
+
+    # Find all logs in a specific directory tree
+    find-agent-logs --find ~/repos
+
+EOF
+            exit 0
+            ;;
+        *)
+            START_PATH="$1"
+            shift
+            ;;
+    esac
+done
+
+# Expand ~ in START_PATH
+START_PATH="${START_PATH/#\~/$HOME}"
+
+find_with_locate() {
+    local start_path="$1"
+    local base_pattern
+
+    # If start_path is not home, we'll need to filter results
+    if [ "$start_path" = "$HOME" ]; then
+        base_pattern="${HOME}/**/.agent.dir/Logs/*.md"
+    else
+        base_pattern="${start_path}/**/.agent.dir/Logs/*.md"
+    fi
+
+    # Use locate to find .agent.dir/Logs directories
+    # Note: locate on macOS doesn't support regex well, so we'll search for .agent.dir
+    # and then filter for Logs subdirectories
+
+    if ! command -v locate &> /dev/null; then
+        echo "Error: locate command not found. Use --find instead or run 'update-locatedb' first." >&2
+        exit 1
+    fi
+
+    # Check if database exists
+    if [ ! -f /var/db/locate.database ]; then
+        echo "Error: locate database not found. Run 'update-locatedb' first." >&2
+        exit 1
+    fi
+
+    # Find all .agent.dir/Logs directories under start path
+    locate ".agent.dir/Logs" | \
+        grep "^${start_path}" | \
+        while IFS= read -r log_dir; do
+            if [ -d "$log_dir" ]; then
+                find "$log_dir" -maxdepth 1 -type f -name "*.md" 2>/dev/null || true
+            fi
+        done
+}
+
+find_with_find() {
+    local start_path="$1"
+
+    # Use find command to search for .agent.dir/Logs directories
+    find "$start_path" -type d -path "*/.agent.dir/Logs" 2>/dev/null | \
+        while IFS= read -r log_dir; do
+            find "$log_dir" -maxdepth 1 -type f -name "*.md" 2>/dev/null || true
+        done
+}
+
+extract_date_from_filename() {
+    local filepath="$1"
+    local filename=$(basename "$filepath" .md)
+
+    # Try to match YYYY-MM-DD pattern
+    if [[ "$filename" =~ ([0-9]{4}-[0-9]{2}-[0-9]{2}) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        # Return empty if no date found
+        echo ""
+    fi
+}
+
+get_file_mtime() {
+    local filepath="$1"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        stat -f "%m" "$filepath" 2>/dev/null || echo "0"
+    else
+        stat -c "%Y" "$filepath" 2>/dev/null || echo "0"
+    fi
+}
+
+format_date() {
+    local timestamp="$1"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        date -r "$timestamp" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown"
+    else
+        date -d "@$timestamp" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown"
+    fi
+}
+
+main() {
+    # Output JSON array
+    echo "["
+    local first=true
+
+    # Collect search paths
+    local search_paths=("$START_PATH")
+
+    # Add cloud directories if requested
+    if [ "$INCLUDE_GDRIVE" = true ] && [ -d "$GDRIVE_PATH" ]; then
+        search_paths+=("$GDRIVE_PATH")
+    fi
+
+    # Find log files from all search paths
+    local find_output=""
+    for search_path in "${search_paths[@]}"; do
+        local path_output
+        if [ "$METHOD" = "locate" ]; then
+            path_output=$(find_with_locate "$search_path" 2>/dev/null || true)
+        else
+            path_output=$(find_with_find "$search_path" 2>/dev/null || true)
+        fi
+
+        if [ -n "$path_output" ]; then
+            if [ -n "$find_output" ]; then
+                find_output="${find_output}"$'\n'"${path_output}"
+            else
+                find_output="$path_output"
+            fi
+        fi
+    done
+
+    # Sort and deduplicate
+    find_output=$(echo "$find_output" | sort -u)
+
+    # Process each log file
+    while IFS= read -r log_file; do
+        [ -z "$log_file" ] && continue
+
+        if [ "$first" = true ]; then
+            first=false
+        else
+            echo ","
+        fi
+
+        local date_from_name=$(extract_date_from_filename "$log_file")
+        local mtime=$(get_file_mtime "$log_file")
+        local mtime_formatted=$(format_date "$mtime")
+        local dir=$(dirname "$log_file")
+        local parent_dir=$(dirname "$dir")
+        local project_dir=$(dirname "$parent_dir")
+
+        cat <<EOF
+  {
+    "path": "$log_file",
+    "filename": "$(basename "$log_file")",
+    "date_from_name": "$date_from_name",
+    "modified_time": "$mtime_formatted",
+    "modified_timestamp": $mtime,
+    "project_dir": "$project_dir",
+    "agent_dir": "$parent_dir"
+  }
+EOF
+    done <<< "$find_output"
+
+    echo ""
+    echo "]"
+}
+
+main
